@@ -1,8 +1,13 @@
 #![no_std]
 #![no_main]
 
+mod ct;
+
 use aya_ebpf::{
-    bindings::TC_ACT_PIPE,
+    bindings::{
+        TC_ACT_PIPE, bpf_sock_tuple, bpf_sock_tuple__bindgen_ty_1,
+        bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1,
+    },
     macros::{classifier, map},
     maps::RingBuf,
     programs::TcContext,
@@ -13,6 +18,8 @@ use network_types::{
     ip::{IpProto, Ipv4Hdr},
     tcp::TcpHdr,
 };
+
+use ct::{bpf_ct_opts, bpf_ct_release, bpf_skb_ct_lookup};
 
 #[map]
 static NEW_FLOWS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -34,7 +41,6 @@ pub fn net_vitals_ingress(ctx: TcContext) -> i32 {
 #[inline(always)]
 fn try_classify(ctx: &TcContext) -> Result<i32, i32> {
     let ethhdr: EthHdr = ctx.load(0).map_err(|_| TC_ACT_PIPE)?;
-    // Copy packed fields to locals to avoid unaligned references
     let ether_type = ethhdr.ether_type;
     if ether_type != EtherType::Ipv4 {
         return Ok(TC_ACT_PIPE);
