@@ -34,7 +34,10 @@ fn main() -> anyhow::Result<()> {
         let dst = Ipv4Addr::from(u32::from_be(event.dst_ip));
         let sp = u16::from_be(event.src_port);
         let dp = u16::from_be(event.dst_port);
-        println!("New flow detected: {src}:{sp} -> {dst}:{dp}");
+        println!(
+            "New flow detected: {src}:{sp} -> {dst}:{dp} [ECN: {0} CWR: {1}]",
+            event.ece, event.cwr
+        );
     });
 
     println!("Exiting...");

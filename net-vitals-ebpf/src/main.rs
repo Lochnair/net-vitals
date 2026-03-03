@@ -110,6 +110,8 @@ fn try_classify(ctx: &TcContext) -> Result<i32, i32> {
             dst_ip,
             src_port,
             dst_port,
+            ece: tcphdr.ece(),
+            cwr: tcphdr.cwr(),
         });
         entry.submit(0);
     }
