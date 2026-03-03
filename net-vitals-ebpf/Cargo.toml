@@ -1,0 +1,17 @@
+[package]
+name = "net-vitals-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+net-vitals-common = { path = "../net-vitals-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "net-vitals"
+path = "src/main.rs"
