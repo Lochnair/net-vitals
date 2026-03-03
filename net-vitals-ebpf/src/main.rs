@@ -17,6 +17,19 @@ fn try_net_vitals(ctx: TcContext) -> Result<i32, i32> {
     Ok(TC_ACT_PIPE)
 }
 
+#[classifier]
+pub fn net_vitals_ingress(ctx: TcContext) -> i32 {
+    match try_net_vitals_ingress(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_net_vitals_ingress(ctx: TcContext) -> Result<i32, i32> {
+    info!(&ctx, "received a packet");
+    Ok(TC_ACT_PIPE)
+}
+
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
