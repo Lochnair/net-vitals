@@ -2,17 +2,21 @@
 #![no_main]
 
 use aya_ebpf::{
-    bindings::TC_ACT_PIPE,
+    bindings::{BPF_ANY, BPF_NOEXIST, TC_ACT_PIPE},
+    helpers::generated::bpf_ktime_get_ns,
     macros::{classifier, map},
-    maps::RingBuf,
+    maps::{LruHashMap, RingBuf},
     programs::TcContext,
 };
-use net_vitals_common::FlowEvent;
+use net_vitals_common::{FlowEvent, FlowKey, FlowState};
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{IpProto, Ipv4Hdr},
     tcp::TcpHdr,
 };
+
+#[map]
+static FLOW_STATE: LruHashMap<FlowKey, FlowState> = LruHashMap::with_max_entries(4096, 0);
 
 #[map]
 static NEW_FLOWS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -49,10 +53,31 @@ fn try_classify(ctx: &TcContext) -> Result<i32, i32> {
         .load(EthHdr::LEN + Ipv4Hdr::LEN)
         .map_err(|_| TC_ACT_PIPE)?;
 
-    let src_ip = ipv4hdr.src_addr;
-    let dst_ip = ipv4hdr.dst_addr;
-    let src_port = tcphdr.source;
-    let dst_port = tcphdr.dest;
+    let key = FlowKey {
+        src_ip: ipv4hdr.src_addr,
+        dst_ip: ipv4hdr.dst_addr,
+        src_port: tcphdr.source,
+        dst_port: tcphdr.dest,
+    };
+
+    FLOW_STATE.insert(
+        key,
+        FlowState {
+            timestamp_ns: unsafe { bpf_ktime_get_ns() },
+            tracked_seq: tcphdr.seq,
+            highest_seq: tcphdr.seq,
+            ecn_packets: 0,
+            retransmits: 0,
+        },
+        BPF_NOEXIST as u64,
+    );
+
+    let state = unsafe { *FLOW_STATE.get_ptr_mut(key).unwrap() };
+    state.timestamp_ns = unsafe { bpf_ktime_get_ns() };
+    state.tracked_seq = tcphdr.seq;
+    state.highest_seq = tcphdr.seq;
+    state.ecn_packets = 0;
+    state.retransmits = 0;
 
     if tcphdr.syn() != 1 {
         return Ok(TC_ACT_PIPE);
