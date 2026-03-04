@@ -1,13 +1,8 @@
 #![no_std]
 #![no_main]
 
-mod ct;
-
 use aya_ebpf::{
-    bindings::{
-        TC_ACT_PIPE, bpf_sock_tuple, bpf_sock_tuple__bindgen_ty_1,
-        bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1,
-    },
+    bindings::TC_ACT_PIPE,
     macros::{classifier, map},
     maps::RingBuf,
     programs::TcContext,
@@ -18,8 +13,6 @@ use network_types::{
     ip::{IpProto, Ipv4Hdr},
     tcp::TcpHdr,
 };
-
-use ct::{bpf_ct_opts, bpf_ct_release, bpf_skb_ct_lookup};
 
 #[map]
 static NEW_FLOWS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -60,45 +53,6 @@ fn try_classify(ctx: &TcContext) -> Result<i32, i32> {
     let dst_ip = ipv4hdr.dst_addr;
     let src_port = tcphdr.source;
     let dst_port = tcphdr.dest;
-
-    // Build the IPv4 5-tuple for conntrack lookup
-    let mut tuple = bpf_sock_tuple {
-        __bindgen_anon_1: bpf_sock_tuple__bindgen_ty_1 {
-            ipv4: bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1 {
-                saddr: src_ip,
-                daddr: dst_ip,
-                sport: src_port,
-                dport: dst_port,
-            },
-        },
-    };
-
-    let mut ct_opts = bpf_ct_opts {
-        netns_id: -1, // BPF_F_CURRENT_NETNS
-        error: 0,
-        l4proto: 6, // IPPROTO_TCP
-        dir: 0,
-        ct_zone_id: 0,
-        ct_zone_dir: 0,
-        reserved: [0; 3],
-    };
-
-    let ct = unsafe {
-        bpf_skb_ct_lookup(
-            ctx.skb.skb,
-            &mut tuple,
-            core::mem::size_of::<bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1>() as u32,
-            &mut ct_opts,
-            core::mem::size_of::<bpf_ct_opts>() as u32,
-        )
-    };
-
-    if !ct.is_null() {
-        // TODO: read ct fields (e.g. tuplehash, status, mark)
-
-        // Must release the conntrack reference
-        unsafe { bpf_ct_release(ct) };
-    }
 
     if tcphdr.syn() != 1 {
         return Ok(TC_ACT_PIPE);
