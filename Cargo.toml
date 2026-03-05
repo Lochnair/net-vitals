@@ -20,13 +20,13 @@ aya = { git = "https://github.com/aya-rs/aya", default-features = false }
 aya-build = { git = "https://github.com/aya-rs/aya", default-features = false }
 aya-ebpf = { git = "https://github.com/aya-rs/aya", default-features = false }
 anyhow = { version = "1", default-features = false }
-cargo_metadata = { version = "0.23.0", default-features = false }
+cargo_metadata = { version = "0.23.1", default-features = false }
 # `std` feature is currently required to build `clap`.
 #
 # See https://github.com/clap-rs/clap/blob/61f5ee5/clap_builder/src/lib.rs#L15.
-clap = { version = "4.5.20", default-features = false, features = ["std"] }
-libc = { version = "0.2.159", default-features = false }
-which = { version = "6.0.0", default-features = false }
+clap = { version = "4.5.60", default-features = false, features = ["std"] }
+libc = { version = "0.2.182", default-features = false }
+which = { version = "8.0.0", default-features = false }
 
 [profile.release.package.net-vitals-ebpf]
 debug = false
