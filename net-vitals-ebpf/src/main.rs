@@ -142,9 +142,12 @@ fn try_classify_egress(ctx: &TcContext) -> Result<i32, i32> {
         dst_port: tcphdr.dest,
     };
 
-    FLOW_STATE.insert(
-        key,
-        FlowState {
+    // ── Flow state tracking ──
+
+    // Insert initial state only for new flows; no-op if the entry already exists.
+    let _ = FLOW_STATE.insert(
+        &key,
+        &FlowState {
             timestamp_ns: unsafe { bpf_ktime_get_ns() },
             tracked_seq: tcphdr.seq,
             highest_seq: tcphdr.seq,
@@ -154,31 +157,118 @@ fn try_classify_egress(ctx: &TcContext) -> Result<i32, i32> {
         BPF_NOEXIST as u64,
     );
 
-    let state = unsafe { *FLOW_STATE.get_ptr_mut(key).unwrap() };
-    state.timestamp_ns = unsafe { bpf_ktime_get_ns() };
-    state.tracked_seq = tcphdr.seq;
-    state.highest_seq = tcphdr.seq;
-    state.ecn_packets = 0;
-    state.retransmits = 0;
-
-    if tcphdr.syn() != 1 {
-        return Ok(TC_ACT_PIPE);
+    // Operate through the raw pointer to update the map entry in-place.
+    if let Some(state) = FLOW_STATE.get_ptr_mut(&key) {
+        unsafe {
+            (*state).timestamp_ns = bpf_ktime_get_ns();
+            (*state).tracked_seq = tcphdr.seq;
+            if tcphdr.seq > (*state).highest_seq {
+                (*state).highest_seq = tcphdr.seq;
+            } else {
+                (*state).retransmits = (*state).retransmits.saturating_add(1);
+            }
+            if tcphdr.ece() != 0 {
+                (*state).ecn_packets = (*state).ecn_packets.saturating_add(1);
+            }
+        }
     }
 
-    if let Some(mut entry) = NEW_FLOWS.reserve::<FlowEvent>(0) {
-        entry.write(FlowEvent {
-            src_ip,
-            dst_ip,
-            src_port,
-            dst_port,
-            ece: tcphdr.ece(),
-            cwr: tcphdr.cwr(),
-        });
-        entry.submit(0);
+    // ── SYN event emission ──
+
+    if tcphdr.syn() == 1 {
+        if let Some(mut entry) = NEW_FLOWS.reserve::<FlowEvent>(0) {
+            entry.write(FlowEvent {
+                src_ip: key.src_ip,
+                dst_ip: key.dst_ip,
+                src_port: key.src_port,
+                dst_port: key.dst_port,
+                ece: tcphdr.ece(),
+                cwr: tcphdr.cwr(),
+            });
+            entry.submit(0);
+        }
+    }
+
+    // ── TCP timestamp storage for RTT measurement ──
+
+    let opts_len = (tcphdr.doff() as usize) * 4;
+    if opts_len > 20 {
+        if let Some((tsval, _tsecr)) = find_tcp_timestamp(ctx, opts_len - 20) {
+            let _ = TS_STORE.insert(
+                &key,
+                &TsEntry {
+                    ktime_ns: unsafe { bpf_ktime_get_ns() },
+                    tsval,
+                    _pad: 0,
+                },
+                BPF_ANY as u64, // overwrite so we always have the latest TSval
+            );
+        }
     }
 
     Ok(TC_ACT_PIPE)
 }
+
+// ── Ingress path ──────────────────────────────────────────────────────────────
+
+#[inline(always)]
+fn try_classify_ingress(ctx: &TcContext) -> Result<i32, i32> {
+    let ethhdr: EthHdr = ctx.load(0).map_err(|_| TC_ACT_PIPE)?;
+    if ethhdr.ether_type != EtherType::Ipv4 {
+        return Ok(TC_ACT_PIPE);
+    }
+
+    let ipv4hdr: Ipv4Hdr = ctx.load(IP_OFFSET).map_err(|_| TC_ACT_PIPE)?;
+    if ipv4hdr.proto != IpProto::Tcp {
+        return Ok(TC_ACT_PIPE);
+    }
+
+    let tcphdr: TcpHdr = ctx.load(TCP_OFFSET).map_err(|_| TC_ACT_PIPE)?;
+
+    let opts_len = (tcphdr.doff() as usize) * 4;
+    if opts_len <= 20 {
+        return Ok(TC_ACT_PIPE); // No TCP options — nothing to do.
+    }
+
+    let (_tsval, tsecr) = match find_tcp_timestamp(ctx, opts_len - 20) {
+        Some(ts) => ts,
+        None => return Ok(TC_ACT_PIPE),
+    };
+
+    // The egress entry was stored with src=local, dst=remote.
+    // The incoming reply has src=remote, dst=local, so we reverse the key.
+    let egress_key = FlowKey {
+        src_ip: ipv4hdr.dst_addr,
+        dst_ip: ipv4hdr.src_addr,
+        src_port: tcphdr.dest,
+        dst_port: tcphdr.source,
+    };
+
+    if let Some(stored) = TS_STORE.get_ptr(&egress_key) {
+        let ts = unsafe { &*stored };
+        // TSecr in the reply must match the TSval we stored.
+        if ts.tsval == tsecr {
+            let now = unsafe { bpf_ktime_get_ns() };
+            if now >= ts.ktime_ns {
+                let rtt_ns = now - ts.ktime_ns;
+                if let Some(mut entry) = RTT_SAMPLES.reserve::<RttSample>(0) {
+                    entry.write(RttSample {
+                        src_ip: egress_key.src_ip,
+                        dst_ip: egress_key.dst_ip,
+                        src_port: egress_key.src_port,
+                        dst_port: egress_key.dst_port,
+                        rtt_ns,
+                    });
+                    entry.submit(0);
+                }
+            }
+        }
+    }
+
+    Ok(TC_ACT_PIPE)
+}
+
+// ── Panic / license ───────────────────────────────────────────────────────────
 
 #[cfg(not(test))]
 #[panic_handler]
