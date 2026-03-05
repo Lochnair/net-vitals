@@ -4,11 +4,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use aya::maps::{MapData, RingBuf};
 use aya::programs::{SchedClassifier, TcAttachType, tc};
-pub use net_vitals_common::FlowEvent;
+pub use net_vitals_common::{FlowEvent, RttSample};
 
 pub struct NetVitals {
-    _ebpf: aya::Ebpf, // must outlive ring_buf; dropping unloads the eBPF program
-    ring_buf: RingBuf<MapData>,
+    _ebpf: aya::Ebpf, // must outlive ring bufs; dropping unloads the eBPF programs
+    flow_buf: RingBuf<MapData>,
+    rtt_buf: RingBuf<MapData>,
 }
 
 impl NetVitals {
@@ -35,32 +36,50 @@ impl NetVitals {
         prog.load()?;
         prog.attach(iface, TcAttachType::Ingress)?;
 
-        let ring_buf = RingBuf::try_from(ebpf.take_map("NEW_FLOWS").unwrap())?;
+        let flow_buf = RingBuf::try_from(ebpf.take_map("NEW_FLOWS").unwrap())?;
+        let rtt_buf = RingBuf::try_from(ebpf.take_map("RTT_SAMPLES").unwrap())?;
 
         Ok(Self {
             _ebpf: ebpf,
-            ring_buf,
+            flow_buf,
+            rtt_buf,
         })
     }
 
-    /// Block-polls the ring buffer, calling `on_event` for each `FlowEvent`,
-    /// until `running` is set to `false` (e.g. from a SIGINT handler).
-    pub fn run(&mut self, running: &AtomicBool, mut on_event: impl FnMut(FlowEvent)) {
-        let fd = self.ring_buf.as_fd().as_raw_fd();
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
+    /// Block-polls both ring buffers, dispatching events to the provided
+    /// callbacks, until `running` is set to `false`.
+    pub fn run(
+        &mut self,
+        running: &AtomicBool,
+        mut on_flow: impl FnMut(FlowEvent),
+        mut on_rtt: impl FnMut(RttSample),
+    ) {
+        let flow_fd = self.flow_buf.as_fd().as_raw_fd();
+        let rtt_fd = self.rtt_buf.as_fd().as_raw_fd();
+
+        let mut pfds = [
+            libc::pollfd { fd: flow_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: rtt_fd, events: libc::POLLIN, revents: 0 },
+        ];
 
         while running.load(Ordering::Relaxed) {
-            let ret = unsafe { libc::poll(&mut pfd, 1, 100) }; // 100 ms timeout
+            let ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 100) };
             if ret > 0 {
-                while let Some(item) = self.ring_buf.next() {
-                    // SAFETY: eBPF wrote a fully-initialized FlowEvent via
-                    // MaybeUninit::write; ring buf guarantees ≥4-byte alignment.
-                    let event = unsafe { *(item.as_ptr() as *const FlowEvent) };
-                    on_event(event);
+                // Drain new-flow events.
+                if pfds[0].revents & libc::POLLIN != 0 {
+                    while let Some(item) = self.flow_buf.next() {
+                        // SAFETY: eBPF wrote a fully-initialised FlowEvent via
+                        // MaybeUninit::write; ring buf guarantees ≥4-byte alignment.
+                        let event = unsafe { *(item.as_ptr() as *const FlowEvent) };
+                        on_flow(event);
+                    }
+                }
+                // Drain RTT samples.
+                if pfds[1].revents & libc::POLLIN != 0 {
+                    while let Some(item) = self.rtt_buf.next() {
+                        let sample = unsafe { *(item.as_ptr() as *const RttSample) };
+                        on_rtt(sample);
+                    }
                 }
             }
         }
